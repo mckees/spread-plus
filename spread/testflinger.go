@@ -356,6 +356,7 @@ func (p *TestFlingerProvider) waitDeviceBoot(ctx context.Context, s *TestFlinger
 		if state == RESERVE {
 			ip, err := p.getIpForReservedDevice(s)
 			if err != nil {
+				s.Discard(ctx)
 				return fmt.Errorf("failed to get Ip: %v: ", err)
 			}
 			s.address = ip
