@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/niemeyer/pretty"
@@ -138,7 +139,7 @@ func run() error {
 	}
 
 	sigch := make(chan os.Signal, 1)
-	signal.Notify(sigch, os.Interrupt)
+	signal.Notify(sigch, os.Interrupt, syscall.SIGTERM)
 	go func() {
 		<-sigch
 		runner.Stop()
