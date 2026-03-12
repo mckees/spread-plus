@@ -354,17 +354,21 @@ func (p *TestFlingerProvider) waitDeviceBoot(ctx context.Context, s *TestFlinger
 		}
 
 		if state == RESERVE {
-			ip, err := p.getIpForReservedDevice(s)
-			if err != nil {
-				s.Discard(ctx)
-				return fmt.Errorf("failed to get Ip: %v: ", err)
+			for _, line := range strings.Split(resRes.ReserveOutput, "\n") {
+				if strings.HasPrefix(line, "You can now connect to ") {
+					if _, addr, ok := strings.Cut(line, "@"); ok {
+						s.address = strings.TrimSpace(addr)
+					}
+					break
+				}
 			}
-			s.address = ip
-			if net.ParseIP(s.address) == nil {
-				return fmt.Errorf("wrong ip format %s: ", s.address)
+			if s.address != "" {
+				if net.ParseIP(s.address) == nil {
+					return fmt.Errorf("wrong ip format %s: ", s.address)
+				}
+				printf("Reserved device with ip %s", s.address)
+				return nil
 			}
-			printf("Reserved device with ip %s", s.address)
-			return nil
 		}
 
 		// The job_id is not active anymore
@@ -379,6 +383,9 @@ func (p *TestFlingerProvider) waitDeviceBoot(ctx context.Context, s *TestFlinger
 		case <-timeout:
 			s.Discard(ctx)
 			return fmt.Errorf("wait timeout reached, job discarded")
+		case <-ctx.Done():
+			s.Discard(ctx)
+			return fmt.Errorf("context cancelled, job discarded")
 		}
 	}
 }
