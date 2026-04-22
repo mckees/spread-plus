@@ -1072,7 +1072,11 @@ Allocate:
 
 	printf("Connecting to %s...", server)
 
-	timeout = time.After(1 * time.Minute)
+	connectTimeout := 5 * time.Minute
+	if system.WaitTimeout.Duration > 0 && system.WaitTimeout.Duration < connectTimeout {
+		connectTimeout = system.WaitTimeout.Duration
+	}
+	timeout = time.After(connectTimeout)
 	relog = time.NewTicker(8 * time.Second)
 	defer relog.Stop()
 	retry = time.NewTicker(5 * time.Second)
