@@ -2,6 +2,7 @@ package spread
 
 import (
 	"bytes"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io/ioutil"
@@ -12,6 +13,7 @@ import (
 	"os"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 
 	"golang.org/x/net/context"
@@ -20,7 +22,12 @@ import (
 )
 
 func TestFlinger(p *Project, b *Backend, o *Options) Provider {
-	return &TestFlingerProvider{p, b, o, &http.Client{}}
+	return &TestFlingerProvider{
+		project: p,
+		backend: b,
+		options: o,
+		client:  &http.Client{},
+	}
 }
 
 type TestFlingerProvider struct {
@@ -29,6 +36,11 @@ type TestFlingerProvider struct {
 	options *Options
 
 	client *http.Client
+
+	// authMu guards authToken, which caches the JWT obtained from the
+	// Testflinger OAuth2 endpoint when client credentials are configured.
+	authMu    sync.Mutex
+	authToken string
 }
 
 type TestFlingerJob struct {
@@ -489,6 +501,121 @@ func getTestflingerUrl(subpath string) string {
 	return url
 }
 
+// testflingerCredentials returns the Testflinger client id and secret key from
+// the environment when both are set. When either is empty, authentication is
+// disabled and requests are sent anonymously, preserving the legacy behavior
+// for servers that do not require authentication.
+func testflingerCredentials() (clientID, secretKey string, ok bool) {
+	clientID = os.Getenv("TESTFLINGER_CLIENT_ID")
+	secretKey = os.Getenv("TESTFLINGER_SECRET_KEY")
+	if clientID == "" || secretKey == "" {
+		return "", "", false
+	}
+	return clientID, secretKey, true
+}
+
+// fetchTestflingerToken exchanges the client id and secret key for a JWT access
+// token via the Testflinger OAuth2 endpoint. It mirrors the official
+// testflinger-cli flow: POST /v1/oauth2/token with an HTTP Basic authorization
+// header built from "client_id:secret_key".
+func fetchTestflingerToken(client *http.Client, clientID, secretKey string) (string, error) {
+	url := getTestflingerUrl("/oauth2/token")
+	req, err := http.NewRequest("POST", url, nil)
+	if err != nil {
+		return "", &FatalError{fmt.Errorf("cannot create TestFlinger auth request: %v", err)}
+	}
+	pair := base64.StdEncoding.EncodeToString([]byte(clientID + ":" + secretKey))
+	req.Header.Set("Authorization", "Basic "+pair)
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("cannot authenticate with TestFlinger: %v", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		return "", fmt.Errorf("cannot read TestFlinger auth response: %v", err)
+	}
+	if resp.StatusCode != 200 {
+		return "", fmt.Errorf("cannot authenticate with TestFlinger (status %d): %s",
+			resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+
+	var parsed struct {
+		AccessToken string `json:"access_token"`
+	}
+	if err := json.Unmarshal(body, &parsed); err != nil {
+		return "", fmt.Errorf("cannot decode TestFlinger auth response: %v", err)
+	}
+	if parsed.AccessToken == "" {
+		return "", fmt.Errorf("TestFlinger auth response did not contain an access token")
+	}
+	return parsed.AccessToken, nil
+}
+
+// ensureAuthToken lazily authenticates with Testflinger when credentials are
+// configured, caching the resulting JWT. It is a no-op when no credentials are
+// set, so anonymous access to unauthenticated servers keeps working.
+func (p *TestFlingerProvider) ensureAuthToken() error {
+	clientID, secretKey, ok := testflingerCredentials()
+	if !ok {
+		return nil
+	}
+	p.authMu.Lock()
+	defer p.authMu.Unlock()
+	if p.authToken != "" {
+		return nil
+	}
+	token, err := fetchTestflingerToken(p.client, clientID, secretKey)
+	if err != nil {
+		return err
+	}
+	p.authToken = token
+	return nil
+}
+
+// refreshAuthToken forces re-authentication, replacing any cached JWT. It is
+// used to recover from an expired token signaled by a 401 response. staleToken
+// is the token that produced the 401; if another goroutine has already
+// refreshed the cached token in the meantime, this is a no-op so concurrent
+// callers don't each perform a redundant token request.
+func (p *TestFlingerProvider) refreshAuthToken(staleToken string) error {
+	clientID, secretKey, ok := testflingerCredentials()
+	if !ok {
+		return nil
+	}
+	p.authMu.Lock()
+	defer p.authMu.Unlock()
+	if p.authToken != staleToken {
+		return nil
+	}
+	token, err := fetchTestflingerToken(p.client, clientID, secretKey)
+	if err != nil {
+		return err
+	}
+	p.authToken = token
+	return nil
+}
+
+// currentAuthToken returns the cached JWT, if any.
+func (p *TestFlingerProvider) currentAuthToken() string {
+	p.authMu.Lock()
+	defer p.authMu.Unlock()
+	return p.authToken
+}
+
+// setAuthHeader attaches the cached JWT as a Bearer token when present and
+// returns the token it used, so callers can detect concurrent refreshes on a
+// subsequent 401.
+func (p *TestFlingerProvider) setAuthHeader(req *http.Request) string {
+	token := p.currentAuthToken()
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	return token
+}
+
 func (p *TestFlingerProvider) do(method, subpath string, params interface{}, result interface{}) error {
 	var data []byte
 	var err error
@@ -502,21 +629,54 @@ func (p *TestFlingerProvider) do(method, subpath string, params interface{}, res
 
 	url := getTestflingerUrl(subpath)
 
+	// Authenticate up front when credentials are configured so the first
+	// request already carries a Bearer token.
+	if err := p.ensureAuthToken(); err != nil {
+		return err
+	}
+
 	// Repeat on 500s. Note that Google's 500s may come in late, as a marshaled error
 	// under a different code. See the INTERNAL handling at the end below.
 	var resp *http.Response
 	var req *http.Request
 	var delays = rand.Perm(10)
+	authRetried := false
 	for i := 0; i < 10; i++ {
 		req, err = http.NewRequest(method, url, bytes.NewBuffer(data))
 		if err != nil {
 			return &FatalError{fmt.Errorf("cannot create HTTP request: %v", err)}
 		}
 		req.Header.Set("Content-Type", "application/json")
+		usedToken := p.setAuthHeader(req)
 		resp, err = p.client.Do(req)
 		if err == nil && 500 <= resp.StatusCode && resp.StatusCode < 600 {
 			time.Sleep(time.Duration(delays[i]) * 250 * time.Millisecond)
 			continue
+		}
+
+		// On a 401 with credentials configured, refresh the token once and
+		// replay the request, matching the testflinger-cli retry behavior.
+		if err == nil && resp.StatusCode == 401 && !authRetried {
+			if _, _, ok := testflingerCredentials(); ok {
+				_, _ = ioutil.ReadAll(resp.Body)
+				resp.Body.Close()
+				if aerr := p.refreshAuthToken(usedToken); aerr != nil {
+					return aerr
+				}
+				authRetried = true
+				continue
+			}
+		}
+
+		// A 401 that survives the retry (or with no credentials configured) is
+		// a hard authorization failure; surface it instead of parsing the body
+		// as a successful response.
+		if err == nil && resp.StatusCode == 401 {
+			body, _ := ioutil.ReadAll(resp.Body)
+			resp.Body.Close()
+			return fmt.Errorf("TestFlinger request to %q was unauthorized (status 401); "+
+				"verify TESTFLINGER_CLIENT_ID and TESTFLINGER_SECRET_KEY: %s",
+				url, strings.TrimSpace(string(body)))
 		}
 
 		if err != nil {
@@ -577,21 +737,54 @@ func (p *TestFlingerProvider) dop(method, subpath string, params interface{}) (s
 
 	url := getTestflingerUrl(subpath)
 
+	// Authenticate up front when credentials are configured so the first
+	// request already carries a Bearer token.
+	if err := p.ensureAuthToken(); err != nil {
+		return "", err
+	}
+
 	// Repeat on 500s. Note that Google's 500s may come in late, as a marshaled error
 	// under a different code. See the INTERNAL handling at the end below.
 	var resp *http.Response
 	var req *http.Request
 	var delays = rand.Perm(10)
+	authRetried := false
 	for i := 0; i < 10; i++ {
 		req, err = http.NewRequest(method, url, bytes.NewBuffer(data))
 		if err != nil {
 			return "", &FatalError{fmt.Errorf("cannot create HTTP request: %v", err)}
 		}
 		req.Header.Set("Content-Type", "application/json")
+		usedToken := p.setAuthHeader(req)
 		resp, err = p.client.Do(req)
 		if err == nil && 500 <= resp.StatusCode && resp.StatusCode < 600 {
 			time.Sleep(time.Duration(delays[i]) * 250 * time.Millisecond)
 			continue
+		}
+
+		// On a 401 with credentials configured, refresh the token once and
+		// replay the request, matching the testflinger-cli retry behavior.
+		if err == nil && resp.StatusCode == 401 && !authRetried {
+			if _, _, ok := testflingerCredentials(); ok {
+				_, _ = ioutil.ReadAll(resp.Body)
+				resp.Body.Close()
+				if aerr := p.refreshAuthToken(usedToken); aerr != nil {
+					return "", aerr
+				}
+				authRetried = true
+				continue
+			}
+		}
+
+		// A 401 that survives the retry (or with no credentials configured) is
+		// a hard authorization failure; surface it instead of returning the
+		// body as a successful response.
+		if err == nil && resp.StatusCode == 401 {
+			body, _ := ioutil.ReadAll(resp.Body)
+			resp.Body.Close()
+			return "", fmt.Errorf("TestFlinger request to %q was unauthorized (status 401); "+
+				"verify TESTFLINGER_CLIENT_ID and TESTFLINGER_SECRET_KEY: %s",
+				url, strings.TrimSpace(string(body)))
 		}
 
 		if err != nil {
