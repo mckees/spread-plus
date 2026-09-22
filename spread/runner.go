@@ -1072,7 +1072,21 @@ Allocate:
 
 	printf("Connecting to %s...", server)
 
-	timeout = time.After(1 * time.Minute)
+	// Post-allocation SSH connect window. Devices provisioned from OEM
+	// images (e.g. Testflinger oem_autoinstall) can take several minutes to
+	// finish first-boot/reboot and bring up sshd after the backend reports
+	// the machine as allocated, so a short window makes spread discard a
+	// perfectly good device. Default to 10 minutes and allow overriding via
+	// SPREAD_CONNECT_TIMEOUT (any Go duration, e.g. "5m", "15m").
+	connectTimeout := 10 * time.Minute
+	if v := os.Getenv("SPREAD_CONNECT_TIMEOUT"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			connectTimeout = d
+		} else {
+			printf("Ignoring invalid SPREAD_CONNECT_TIMEOUT %q: %v", v, err)
+		}
+	}
+	timeout = time.After(connectTimeout)
 	relog = time.NewTicker(8 * time.Second)
 	defer relog.Stop()
 	retry = time.NewTicker(5 * time.Second)
