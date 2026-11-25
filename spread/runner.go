@@ -1049,6 +1049,16 @@ Allocate:
 			}
 		}
 
+		// Check the timeout on its own first. Allocate can block far longer
+		// than the 5 minute window (Testflinger waits up to wait-timeout),
+		// after which timeout, retry and relog are all ready and a single
+		// select would pick one at random, re-submitting the job 2 times
+		// out of 3.
+		select {
+		case <-timeout:
+			break Allocate
+		default:
+		}
 		select {
 		case <-retry.C:
 		case <-relog.C:

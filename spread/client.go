@@ -25,6 +25,40 @@ import (
 
 var sshDial = ssh.Dial
 
+// SSH keepalive probing. A device that disappears without closing the TCP
+// stream (e.g. a Testflinger reservation expiring mid-task) otherwise leaves
+// session.Wait blocked until kill-timeout. Package variables so tests can
+// shorten them.
+var (
+	sshKeepAliveInterval = 30 * time.Second
+	sshKeepAliveTimeout  = 2 * time.Minute
+)
+
+// keepAlive sends keepalive@openssh.com requests over sshc until it is
+// closed. If the peer stops replying for sshKeepAliveTimeout, sshc is
+// closed so pending sessions fail instead of hanging.
+func keepAlive(sshc *ssh.Client, addr string) {
+	for {
+		reply := make(chan error, 1)
+		go func() {
+			_, _, err := sshc.SendRequest("keepalive@openssh.com", true, nil)
+			reply <- err
+		}()
+		select {
+		case err := <-reply:
+			if err != nil {
+				// Connection already closed.
+				return
+			}
+		case <-time.After(sshKeepAliveTimeout):
+			printf("No SSH keepalive reply from %s in %s, closing connection.", addr, sshKeepAliveTimeout)
+			sshc.Close()
+			return
+		}
+		time.Sleep(sshKeepAliveInterval)
+	}
+}
+
 type Client struct {
 	server Server
 	sshc   *ssh.Client
@@ -81,6 +115,7 @@ func Dial(server Server, username, password string, sshKey string, sshKeyPass st
 	if err != nil {
 		return nil, fmt.Errorf("cannot connect to %s: %v", server, err)
 	}
+	go keepAlive(sshc, addr)
 	client := &Client{
 		server: server,
 		sshc:   sshc,
@@ -134,6 +169,7 @@ func (c *Client) dialOnReboot(prevBootID string) error {
 			} else {
 				// Successfully connected via SSH; create an SSH client.
 				sshc := ssh.NewClient(clientConn, chans, reqs)
+				go keepAlive(sshc, c.addr)
 
 				// once successfully connected, check boot_id to
 				// see if the reboot actually happened
