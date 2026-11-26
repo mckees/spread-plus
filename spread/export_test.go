@@ -37,6 +37,18 @@ func MockSshDial(f func(network, addr string, config *ssh.ClientConfig) (*ssh.Cl
 	}
 }
 
+func KeepAlive(sshc *ssh.Client, addr string) {
+	keepAlive(sshc, addr)
+}
+
+func MockKeepAlive(interval, timeout time.Duration) (restore func()) {
+	oldInterval, oldTimeout := sshKeepAliveInterval, sshKeepAliveTimeout
+	sshKeepAliveInterval, sshKeepAliveTimeout = interval, timeout
+	return func() {
+		sshKeepAliveInterval, sshKeepAliveTimeout = oldInterval, oldTimeout
+	}
+}
+
 func MockTimeNow(f func() time.Time) (restore func()) {
 	oldTimeNow := timeNow
 	timeNow = f
