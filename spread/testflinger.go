@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io/ioutil"
-	"math/rand"
 	"net"
 	"net/http"
 	"net/url"
@@ -17,8 +16,6 @@ import (
 
 	"github.com/joho/godotenv"
 	"golang.org/x/net/context"
-
-	"github.com/niemeyer/pretty"
 )
 
 func TestFlinger(p *Project, b *Backend, o *Options) Provider {
@@ -565,14 +562,15 @@ func (p *TestFlingerProvider) getAccessToken() (string, error) {
 	}
 
 	tokenURL := getTestflingerUrl("/oauth2/token")
-	req, err := http.NewRequest("POST", tokenURL, bytes.NewBuffer(nil))
-	if err != nil {
-		return "", &FatalError{fmt.Errorf("cannot create TestFlinger token request: %v", err)}
-	}
-	req.Header.Set("Content-Type", "application/json")
-	p.addTestFlingerClientAuth(req)
-
-	resp, err := p.client.Do(req)
+	resp, err := p.send(func() (*http.Request, error) {
+		req, err := http.NewRequest("POST", tokenURL, bytes.NewBuffer(nil))
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Content-Type", "application/json")
+		p.addTestFlingerClientAuth(req)
+		return req, nil
+	})
 	if err != nil {
 		return "", fmt.Errorf("cannot perform TestFlinger token request: %v", err)
 	}
@@ -601,9 +599,46 @@ func (p *TestFlingerProvider) getAccessToken() (string, error) {
 	return tokenResp.AccessToken, nil
 }
 
-func (p *TestFlingerProvider) do(method, subpath string, params interface{}, result interface{}) error {
+// testFlingerRetryDelays are the waits between attempts when a TestFlinger
+// request fails with a network error or a 5xx response. They add up to about
+// three minutes, so a short network outage on the host running spread does
+// not abort allocation, job status polling or discarding.
+var testFlingerRetryDelays = []time.Duration{
+	1 * time.Second, 2 * time.Second, 4 * time.Second, 8 * time.Second, 15 * time.Second,
+	30 * time.Second, 30 * time.Second, 30 * time.Second, 30 * time.Second, 30 * time.Second,
+}
+
+// send performs the request built by newReq, retrying network errors and 5xx
+// responses after each of testFlingerRetryDelays. The caller must close the
+// body of the returned response.
+func (p *TestFlingerProvider) send(newReq func() (*http.Request, error)) (*http.Response, error) {
+	for attempt := 0; ; attempt++ {
+		req, err := newReq()
+		if err != nil {
+			return nil, &FatalError{fmt.Errorf("cannot create HTTP request: %v", err)}
+		}
+		resp, err := p.client.Do(req)
+		if err == nil && (resp.StatusCode < 500 || resp.StatusCode >= 600) {
+			return resp, nil
+		}
+		if err == nil {
+			resp.Body.Close()
+			err = fmt.Errorf("HTTP status %d", resp.StatusCode)
+		}
+		if attempt == len(testFlingerRetryDelays) {
+			return nil, fmt.Errorf("%s %s failed after %d attempts: %v", req.Method, req.URL.Path, attempt+1, err)
+		}
+		delay := testFlingerRetryDelays[attempt]
+		printf("TestFlinger request %s %s failed, retrying in %s: %v", req.Method, req.URL.Path, delay, err)
+		time.Sleep(delay)
+	}
+}
+
+// request sends an authenticated TestFlinger API request and returns the
+// response status and body.
+func (p *TestFlingerProvider) request(method, subpath string, params interface{}) (int, []byte, error) {
 	if p.authErr != nil {
-		return p.authErr
+		return 0, nil, p.authErr
 	}
 
 	var data []byte
@@ -612,131 +647,70 @@ func (p *TestFlingerProvider) do(method, subpath string, params interface{}, res
 	if params != nil {
 		data, err = json.Marshal(params)
 		if err != nil {
-			return fmt.Errorf("cannot marshal TestFlinger request parameters: %s", err)
+			return 0, nil, fmt.Errorf("cannot marshal TestFlinger request parameters: %s", err)
 		}
 	}
 
 	url := getTestflingerUrl(subpath)
 	token, err := p.getAccessToken()
 	if err != nil {
-		return err
+		return 0, nil, err
 	}
 
-	// Repeat on 500s. Note that Google's 500s may come in late, as a marshaled error
-	// under a different code. See the INTERNAL handling at the end below.
-	var resp *http.Response
-	var req *http.Request
-	var delays = rand.Perm(10)
-	for i := 0; i < 10; i++ {
-		req, err = http.NewRequest(method, url, bytes.NewBuffer(data))
+	resp, err := p.send(func() (*http.Request, error) {
+		req, err := http.NewRequest(method, url, bytes.NewBuffer(data))
 		if err != nil {
-			return &FatalError{fmt.Errorf("cannot create HTTP request: %v", err)}
+			return nil, err
 		}
 		req.Header.Set("Content-Type", "application/json")
 		p.addTestFlingerBearerAuth(req, token)
-		resp, err = p.client.Do(req)
-		if err == nil && 500 <= resp.StatusCode && resp.StatusCode < 600 {
-			time.Sleep(time.Duration(delays[i]) * 250 * time.Millisecond)
-			continue
-		}
-
-		if err != nil {
-			return fmt.Errorf("cannot perform TestFlinger request: %v", err)
-		}
-
-		data, err := ioutil.ReadAll(resp.Body)
-		if err != nil {
-			return fmt.Errorf("cannot read TestFlinger response: %v", err)
-		}
-
-		if result != nil {
-			// Unmarshal even on errors, so the call site has a chance to inspect the data on errors.
-			err = json.Unmarshal(data, result)
-			if err != nil && resp.StatusCode == 404 {
-				return errTestFlingerNotFound
-			}
-			// If unmarshalling fails, surface a more actionable error when the body isn't JSON
-			// (e.g. an HTML error/login/proxy page), which often indicates the endpoint
-			// wasn't reached as expected rather than a malformed API response.
-			if err != nil {
-
-				if !json.Valid(data) {
-					snippet := strings.TrimSpace(string(data))
-					if len(snippet) > 200 {
-						snippet = snippet[:200] + "..."
-					}
-					return fmt.Errorf("TestFlinger endpoint %q returned a non-JSON response (HTTP %d); "+
-						"check that the server is reachable and that TF_ENDPOINT is correct: %s",
-						url, resp.StatusCode, snippet)
-				}
-				return err
-			}
-		}
-
-		break
-	}
-
+		return req, nil
+	})
 	if err != nil {
-		info := pretty.Sprintf("Request:\n-----\n%# v\n-----\nResponse:\n-----\n%s\n-----\n", params, data)
-		return fmt.Errorf("cannot decode TestFlinger response (status %d): %s\n%s", resp.StatusCode, err, info)
+		return 0, nil, fmt.Errorf("cannot perform TestFlinger request: %v", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		return 0, nil, fmt.Errorf("cannot read TestFlinger response: %v", err)
+	}
+	return resp.StatusCode, body, nil
+}
+
+func (p *TestFlingerProvider) do(method, subpath string, params interface{}, result interface{}) error {
+	status, data, err := p.request(method, subpath, params)
+	if err != nil || result == nil {
+		return err
 	}
 
-	return nil
+	// Unmarshal even on errors, so the call site has a chance to inspect the data on errors.
+	err = json.Unmarshal(data, result)
+	if err != nil && status == 404 {
+		return errTestFlingerNotFound
+	}
+	// If unmarshalling fails, surface a more actionable error when the body isn't JSON
+	// (e.g. an HTML error/login/proxy page), which often indicates the endpoint
+	// wasn't reached as expected rather than a malformed API response.
+	if err != nil && !json.Valid(data) {
+		snippet := strings.TrimSpace(string(data))
+		if len(snippet) > 200 {
+			snippet = snippet[:200] + "..."
+		}
+		return fmt.Errorf("TestFlinger endpoint %q returned a non-JSON response (HTTP %d); "+
+			"check that the server is reachable and that TF_ENDPOINT is correct: %s",
+			getTestflingerUrl(subpath), status, snippet)
+	}
+	return err
 }
 
 // This is used when the response is plain text (it is not a json formatted response)
 func (p *TestFlingerProvider) dop(method, subpath string, params interface{}) (string, error) {
-	if p.authErr != nil {
-		return "", p.authErr
-	}
-
-	var data []byte
-	var err error
-
-	if params != nil {
-		data, err = json.Marshal(params)
-		if err != nil {
-			return "", fmt.Errorf("cannot marshal TestFlinger request parameters: %s", err)
-		}
-	}
-
-	url := getTestflingerUrl(subpath)
-	token, err := p.getAccessToken()
+	_, data, err := p.request(method, subpath, params)
 	if err != nil {
 		return "", err
 	}
-
-	// Repeat on 500s. Note that Google's 500s may come in late, as a marshaled error
-	// under a different code. See the INTERNAL handling at the end below.
-	var resp *http.Response
-	var req *http.Request
-	var delays = rand.Perm(10)
-	for i := 0; i < 10; i++ {
-		req, err = http.NewRequest(method, url, bytes.NewBuffer(data))
-		if err != nil {
-			return "", &FatalError{fmt.Errorf("cannot create HTTP request: %v", err)}
-		}
-		req.Header.Set("Content-Type", "application/json")
-		p.addTestFlingerBearerAuth(req, token)
-		resp, err = p.client.Do(req)
-		if err == nil && 500 <= resp.StatusCode && resp.StatusCode < 600 {
-			time.Sleep(time.Duration(delays[i]) * 250 * time.Millisecond)
-			continue
-		}
-
-		if err != nil {
-			return "", fmt.Errorf("cannot perform TestFlinger request: %v", err)
-		}
-
-		data, err := ioutil.ReadAll(resp.Body)
-		if err != nil {
-			return "", fmt.Errorf("cannot read TestFlinger response: %v", err)
-		}
-
-		return string(data), nil
-	}
-
-	return "", fmt.Errorf("too many retries performing TestFlinger request")
+	return string(data), nil
 }
 
 var errTestFlingerNotFound = fmt.Errorf("not found")
