@@ -108,6 +108,7 @@ func fakeTestFlinger(c *C, fail func(w http.ResponseWriter, r *http.Request) boo
 		}
 	}))
 	restoreDelays := spread.FakeTestFlingerRetryDelays([]time.Duration{0, 0, 0})
+	restoreTimeout := spread.FakeTestFlingerRequestTimeout(200 * time.Millisecond)
 	oldEndpoint, hadEndpoint := os.LookupEnv("TF_ENDPOINT")
 	os.Setenv("TF_ENDPOINT", server.URL)
 	p := spread.TestFlinger(&spread.Project{}, &spread.Backend{}, &spread.Options{})
@@ -117,6 +118,7 @@ func fakeTestFlinger(c *C, fail func(w http.ResponseWriter, r *http.Request) boo
 		} else {
 			os.Unsetenv("TF_ENDPOINT")
 		}
+		restoreTimeout()
 		restoreDelays()
 		server.Close()
 	}
@@ -146,6 +148,29 @@ func (s *TestFlingerSuite) TestDoRetriesNetworkErrors(c *C) {
 	c.Assert(err, IsNil)
 	c.Assert(result["job_state"], Equals, "waiting")
 	c.Assert(hits, DeepEquals, map[string]int{"/v1/oauth2/token": 3, "/v1/result/job": 3})
+}
+
+func (s *TestFlingerSuite) TestDoRetriesUnansweredRequests(c *C) {
+	attempts := 0
+	p, cleanup := fakeTestFlinger(c, func(w http.ResponseWriter, r *http.Request) bool {
+		if r.URL.Path != "/v1/result/job" {
+			return false
+		}
+		attempts++
+		if attempts == 1 {
+			// Hold the request past the client timeout, as a hung server does.
+			time.Sleep(time.Second)
+			return true
+		}
+		return false
+	})
+	defer cleanup()
+
+	var result map[string]interface{}
+	err := spread.DoTestFlingerRequest(p, "GET", "/result/job", &result)
+	c.Assert(err, IsNil)
+	c.Assert(result["job_state"], Equals, "waiting")
+	c.Assert(attempts, Equals, 2)
 }
 
 func (s *TestFlingerSuite) TestDoGivesUpOnPersistent5xx(c *C) {

@@ -23,7 +23,7 @@ func TestFlinger(p *Project, b *Backend, o *Options) Provider {
 		project: p,
 		backend: b,
 		options: o,
-		client:  &http.Client{},
+		client:  &http.Client{Timeout: testFlingerRequestTimeout},
 	}
 	// Initialize credentials once so requests only use cached values.
 	if err := tp.checkAuth(); err != nil {
@@ -260,12 +260,15 @@ func (p *TestFlingerProvider) Allocate(ctx context.Context, system *System) (Ser
 	err = p.waitDeviceBoot(ctx, s)
 	if err != nil {
 		if p.options.Logs != "" {
-			saveErr := p.saveJobResultsOutput(s)
-			if saveErr != nil {
-				return nil, fmt.Errorf("error saving job result output: %v", err)
+			if saveErr := p.saveJobResultsOutput(s); saveErr != nil {
+				printf("Cannot save output of TestFlinger job %s: %v", s.d.JobId, saveErr)
 			}
 		}
-		s.Discard(ctx)
+		// The job is still queued or running; cancel it so it does not hold
+		// the device for the rest of its reservation.
+		if discardErr := s.Discard(ctx); discardErr != nil {
+			printf("Cannot cancel TestFlinger job %s for %s: %v", s.d.JobId, s.d.Name, discardErr)
+		}
 		return nil, err
 	}
 	return s, nil
@@ -599,10 +602,15 @@ func (p *TestFlingerProvider) getAccessToken() (string, error) {
 	return tokenResp.AccessToken, nil
 }
 
+// testFlingerRequestTimeout bounds a single TestFlinger request, including
+// reading the response. Without it a request the server never answers blocks
+// its worker forever; on timeout the request is retried like a network error.
+var testFlingerRequestTimeout = 1 * time.Minute
+
 // testFlingerRetryDelays are the waits between attempts when a TestFlinger
-// request fails with a network error or a 5xx response. They add up to about
-// three minutes, so a short network outage on the host running spread does
-// not abort allocation, job status polling or discarding.
+// request fails with a network error, a timeout or a 5xx response. They add
+// up to about three minutes, so a short outage between spread and TestFlinger
+// does not abort allocation, job status polling or discarding.
 var testFlingerRetryDelays = []time.Duration{
 	1 * time.Second, 2 * time.Second, 4 * time.Second, 8 * time.Second, 15 * time.Second,
 	30 * time.Second, 30 * time.Second, 30 * time.Second, 30 * time.Second, 30 * time.Second,
